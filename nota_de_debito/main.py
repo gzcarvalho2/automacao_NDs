@@ -1,5 +1,9 @@
 import time
+import os
+import shutil
+import fitz  # PyMuPDF
 import pandas as pd
+import unicodedata
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.common.by import By
@@ -10,27 +14,33 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
 class FiscalBot:
     """
-    Classe que encapsula toda a lógica para a automação do portal Fiscal.
+    Classe completa para automação do portal Fiscal, incluindo download, análise e organização de PDFs.
     """
-    def __init__(self, driver):
-        """
-        O construtor da classe. Recebe a instância do driver do Selenium.
-        """
+    def __init__(self, driver, pasta_download, pasta_destino, regras_classificacao):
         self.driver = driver
         self.wait = WebDriverWait(self.driver, 20)
         self.dados_processados = []
-        # Agrupa todos os seletores em um único lugar para fácil manutenção
+        
         self.seletores = {
             "linhas_dados": "//div[contains(@class, 'flora--c-gqwkJN-ihfFBCg-css') and .//input[starts-with(@data-testid, 'select-debit-note-')]]",
             "botao_pdf": ".//button[text()='PDF']",
             "celulas_texto": ".//span[contains(@class, 'flora--c-LLdDZ')]",
             "proxima_pagina": "//button[@aria-current='true']/following-sibling::button[1]"
         }
+        
+        self.pasta_download_temp = pasta_download
+        self.pasta_destino_final = pasta_destino
+        self.regras = regras_classificacao
+
+    def _normalizar_texto(self, texto):
+        """Remove acentos, caracteres especiais de uma string e a converte para maiúsculas."""
+        if not texto: return ""
+        texto = texto.upper()
+        nfkd_form = unicodedata.normalize('NFKD', texto)
+        return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
     def navegar_para_aba_correta(self, titulo_alvo):
-        """
-        Encontra e muda para a aba do navegador com o título especificado.
-        """
+        """Encontra e muda para a aba do navegador com o título especificado."""
         for handle in self.driver.window_handles:
             self.driver.switch_to.window(handle)
             if titulo_alvo.lower() in self.driver.title.lower():
@@ -40,14 +50,10 @@ class FiscalBot:
         return False
 
     def _processar_pagina_atual(self):
-        """
-        Método 'privado' que contém a lógica para processar todas as linhas da página visível.
-        """
-        # Pega a contagem inicial de linhas
+        """Contém a lógica para processar todas as linhas da página visível."""
         total_linhas = len(self.driver.find_elements(By.XPATH, self.seletores["linhas_dados"]))
         print(f"Encontradas {total_linhas} linhas de dados para processar.")
         
-        # Loop por índice, a abordagem mais segura
         for i in range(total_linhas):
             try:
                 elementos_linha = self.driver.find_elements(By.XPATH, self.seletores["linhas_dados"])
@@ -71,9 +77,10 @@ class FiscalBot:
                     actions = ActionChains(self.driver)
                     actions.move_to_element(botao_pdf).double_click().perform()
                     
-                    print(f"  -> Botão PDF clicado (duplo). Aguardando 2 segundos...")
-                    time.sleep(2)
+                    print(f"  -> Botão PDF clicado (duplo). Aguardando download concluir...")
                     status_arquivo = "Download iniciado"
+
+                    self._organizar_ultimo_arquivo_baixado()
 
                 except Exception as click_error:
                     print(f"  -> AVISO: Falha ao clicar no botão da linha {i+1}: {click_error}")
@@ -84,33 +91,137 @@ class FiscalBot:
             except Exception as loop_error:
                 print(f"  -> ERRO inesperado no loop na linha {i+1}: {loop_error}")
 
+    def _organizar_ultimo_arquivo_baixado(self):
+        """Orquestra o processo de análise e organização do arquivo mais recente."""
+        print("    -> Iniciando rotina de organização de arquivo...")
+        
+        arquivo_recente = self._esperar_e_encontrar_novo_download()
+        if not arquivo_recente:
+            print("    -> AVISO: Download não concluído ou arquivo não encontrado no tempo limite.")
+            return
+
+        texto_pdf = self._extrair_texto_do_pdf(arquivo_recente)
+        if not texto_pdf:
+            print(f"    -> AVISO: Não foi possível ler o conteúdo do arquivo {os.path.basename(arquivo_recente)}. Movendo para destino.")
+            shutil.move(arquivo_recente, self.pasta_destino_final)
+            return
+
+        self._classificar_renomear_e_mover(arquivo_recente, texto_pdf)
+
+    def _esperar_e_encontrar_novo_download(self, timeout=30):
+        """Espera ativamente por um novo arquivo .pdf e verifica se o download terminou."""
+        segundos_passados = 0
+        arquivos_antes = set(os.listdir(self.pasta_download_temp))
+        while segundos_passados < timeout:
+            time.sleep(1)
+            segundos_passados += 1
+            arquivos_depois = set(os.listdir(self.pasta_download_temp))
+            novos_arquivos = arquivos_depois - arquivos_antes
+            
+            for arquivo in novos_arquivos:
+                if arquivo.endswith(".pdf") and not arquivo.endswith(".crdownload"):
+                    caminho_completo = os.path.join(self.pasta_download_temp, arquivo)
+                    try:
+                        tamanho_inicial = os.path.getsize(caminho_completo)
+                        time.sleep(1.5)
+                        tamanho_final = os.path.getsize(caminho_completo)
+                        if tamanho_inicial == tamanho_final and tamanho_final > 0:
+                            print(f"    -> Novo arquivo '{arquivo}' encontrado e download concluído.")
+                            return caminho_completo
+                    except (OSError, FileNotFoundError):
+                        continue
+        return None
+
+    def _extrair_texto_do_pdf(self, caminho_arquivo):
+        """Extrai o texto de um arquivo PDF."""
+        try:
+            with fitz.open(caminho_arquivo) as doc:
+                texto_completo = ""
+                for page in doc:
+                    texto_completo += page.get_text()
+                print(f"    -> Texto extraído de {os.path.basename(caminho_arquivo)}.")
+                return texto_completo
+        except Exception as e:
+            print(f"      -> Erro ao ler o PDF: {e}")
+            return ""
+
+    def _classificar_renomear_e_mover(self, caminho_arquivo, texto_pdf):
+        """Compara o texto normalizado com as regras e move o arquivo."""
+        texto_pdf_normalizado = self._normalizar_texto(texto_pdf)
+        print("    -> Verificando regras de classificação...")
+        
+        categoria_final_para_nome = None
+        caminho_relativo_pasta = None
+
+        for categoria, regra in self.regras.items():
+            if isinstance(regra, dict):
+                sub_categoria_encontrada = None
+                # PRIMEIRO, procura pelas subcategorias que são mais específicas
+                for sub_cat, sub_palavra_chave in regra["subcategorias"].items():
+                    sub_chave_normalizada = self._normalizar_texto(sub_palavra_chave)
+                    print(f"      - Testando sub-regra '{sub_cat}'. Procurando por: '{sub_chave_normalizada}'...")
+                    if sub_chave_normalizada in texto_pdf_normalizado:
+                        print(f"      -> Subcategoria encontrada: '{sub_cat}'")
+                        sub_categoria_encontrada = sub_cat
+                        break
+                
+                if sub_categoria_encontrada:
+                    caminho_relativo_pasta = os.path.join(categoria, sub_categoria_encontrada)
+                    categoria_final_para_nome = sub_categoria_encontrada
+                    break
+                
+                # SE NÃO ACHOU subcategoria, procura pelo gatilho geral
+                gatilho_normalizado = self._normalizar_texto(regra.get("gatilho", ""))
+                print(f"      - Testando gatilho '{categoria}'. Procurando por: '{gatilho_normalizado}'...")
+                if gatilho_normalizado and gatilho_normalizado in texto_pdf_normalizado:
+                    print(f"      -> GATILHO ENCONTRADO para '{categoria}'.")
+                    caminho_relativo_pasta = categoria
+                    categoria_final_para_nome = categoria
+                    break
+            
+            elif isinstance(regra, str):
+                regra_normalizada = self._normalizar_texto(regra)
+                print(f"      - Testando regra simples '{categoria}'. Procurando por: '{regra_normalizada}'...")
+                if regra_normalizada and regra_normalizada in texto_pdf_normalizado:
+                    print(f"      -> REGRA ENCONTRADA para '{categoria}'")
+                    caminho_relativo_pasta = categoria
+                    categoria_final_para_nome = categoria
+                    break
+
+        if caminho_relativo_pasta:
+            try:
+                pasta_destino_final_abs = os.path.join(self.pasta_destino_final, caminho_relativo_pasta)
+                os.makedirs(pasta_destino_final_abs, exist_ok=True)
+                nome_base, extensao = os.path.splitext(os.path.basename(caminho_arquivo))
+                novo_nome = f"{nome_base}_{categoria_final_para_nome}{extensao}"
+                caminho_final_arquivo = os.path.join(pasta_destino_final_abs, novo_nome)
+                shutil.move(caminho_arquivo, caminho_final_arquivo)
+                print(f"    -> Arquivo classificado como '{categoria_final_para_nome}' e movido para: {pasta_destino_final_abs}")
+            except Exception as e:
+                print(f"      -> ERRO ao mover/renomear arquivo: {e}")
+        else:
+            print("    -> Nenhuma regra correspondeu. Movendo para a pasta de destino principal.")
+            shutil.move(caminho_arquivo, self.pasta_destino_final)
+
     def _ir_para_proxima_pagina(self):
-        """
-        Método 'privado' que clica no botão de próxima página e espera o recarregamento.
-        """
+        """Clica no botão de próxima página e espera o recarregamento."""
         print("\nProcessamento da página concluído. Verificando próxima página...")
         try:
             elemento_referencia = self.driver.find_element(By.XPATH, self.seletores["linhas_dados"])
             proxima_pagina_btn = self.driver.find_element(By.XPATH, self.seletores["proxima_pagina"])
-
             if "..." in proxima_pagina_btn.text:
                 print("Fim das páginas sequenciais. Encerrando.")
                 return False
-
             print("Próxima página encontrada. Clicando...")
             proxima_pagina_btn.click()
-            
             self.wait.until(EC.staleness_of(elemento_referencia))
             return True
-
         except NoSuchElementException:
             print("Não há mais botões de próxima página. Automação concluída.")
             return False
 
     def gerar_relatorio_final(self):
-        """
-        Cria e exibe o DataFrame do Pandas com todos os dados coletados.
-        """
+        """Cria e exibe o DataFrame do Pandas com todos os dados coletados."""
         if self.dados_processados:
             print(f"\n--- RELATÓRIO FINAL ---")
             print(f"Sucesso! {len(self.dados_processados)} linhas foram processadas no total.")
@@ -120,49 +231,71 @@ class FiscalBot:
             print(df)
 
     def executar(self):
-        """
-        Método principal que orquestra toda a automação.
-        """
+        """Método principal que orquestra toda a automação."""
         if not self.navegar_para_aba_correta(TITULO_DA_PAGINA_ALVO):
             return
-
         pagina_atual = 1
         while True:
             print(f"\n--- PROCESSANDO PÁGINA {pagina_atual} ---")
-            
             try:
                 self.wait.until(EC.presence_of_element_located((By.XPATH, self.seletores["linhas_dados"])))
             except TimeoutException:
                 print("Tempo esgotado. Nenhuma linha de dados encontrada nesta página. Encerrando.")
                 break
-
             self._processar_pagina_atual()
-            
             if not self._ir_para_proxima_pagina():
                 break
-            
             pagina_atual += 1
-        
         self.gerar_relatorio_final()
 
 # --- BLOCO PRINCIPAL DE EXECUÇÃO ---
 if __name__ == "__main__":
     TITULO_DA_PAGINA_ALVO = "Fiscal | Extranet"
+    
+    # ========================== ÁREA DE CONFIGURAÇÃO ==========================
+    
+    # 1. Defina a pasta TEMPORÁRIA para onde o navegador vai baixar os arquivos.
+    PASTA_DOWNLOAD_TEMP = "C:\\Users\\gabri\\Downloads\\Notas_Temporarias"
 
+    # 2. Defina a pasta FINAL onde os arquivos serão organizados.
+    PASTA_DESTINO_FINAL = "C:\\Users\\gabri\\Downloads\\Notas_de_Debito_Organizadas"
+
+    # 3. Defina suas regras de classificação.
+    #    Não se preocupe com acentos ou maiúsculas/minúsculas.
+    REGRAS_DE_CLASSIFICACAO = {
+        "marketing_institucional": "despesas de propaganda e esforços de marketing",
+        "seguro": "Seguro",
+        "outras_despesas_administrativas": "ECAD",
+        "telecom": "Remuneração Esforços Tech",
+        "MKT-REG": {
+            "gatilho": "Mídia Regional",
+            "subcategorias": {
+                "MKT-REG_1": "Gestão Franqueador",
+                "MKT-REG_5": "Gestão Individual",
+                "MKT-REG_9": "REEMB ESF BOTIEXPERT"
+            }
+        }
+    }
+    # ========================================================================
+    
     print("Iniciando automação...")
     try:
+        os.makedirs(PASTA_DOWNLOAD_TEMP, exist_ok=True)
+        os.makedirs(PASTA_DESTINO_FINAL, exist_ok=True)
+
         edge_options = Options()
+        prefs = {"download.default_directory": PASTA_DOWNLOAD_TEMP}
+        edge_options.add_experimental_option("prefs", prefs)
         edge_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+        
         driver = webdriver.Edge(options=edge_options)
         
-        # Cria a instância do robô
-        bot = FiscalBot(driver)
-        # Executa a automação
+        bot = FiscalBot(driver, PASTA_DOWNLOAD_TEMP, PASTA_DESTINO_FINAL, REGRAS_DE_CLASSIFICACAO)
+        
         bot.executar()
 
     except Exception as e:
         print(f"\n--- ERRO NO PROCESSAMENTO GERAL ---")
-        print("Não foi possível iniciar o robô. Verifique se o navegador está aberto e foi iniciado com o comando correto.")
         print(f"Ocorreu um erro inesperado: {e}")
     finally:
         print("\nScript finalizado. O navegador continua aberto.")
