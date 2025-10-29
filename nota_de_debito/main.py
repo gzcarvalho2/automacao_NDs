@@ -1,9 +1,11 @@
+
 import time
 import os
 import shutil
 import fitz  # PyMuPDF
 import pandas as pd
 import unicodedata
+from datetime import date  # Importado para usar a data atual
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.common.by import By
@@ -103,7 +105,8 @@ class FiscalBot:
         texto_pdf = self._extrair_texto_do_pdf(arquivo_recente)
         if not texto_pdf:
             print(f"    -> AVISO: Não foi possível ler o conteúdo do arquivo {os.path.basename(arquivo_recente)}. Movendo para destino.")
-            shutil.move(arquivo_recente, self.pasta_destino_final)
+            # Move para "arquivos gerais" mesmo se não puder ler
+            self._mover_para_arquivos_gerais(arquivo_recente)
             return
 
         self._classificar_renomear_e_mover(arquivo_recente, texto_pdf)
@@ -144,10 +147,32 @@ class FiscalBot:
         except Exception as e:
             print(f"      -> Erro ao ler o PDF: {e}")
             return ""
+            
+    def _mover_para_arquivos_gerais(self, caminho_arquivo):
+        """Função auxiliar para mover arquivos para a pasta 'arquivos gerais'."""
+        try:
+            # Cria o caminho para a pasta "arquivos gerais" dentro da pasta de destino final (que já tem a data)
+            pasta_arquivos_gerais = os.path.join(self.pasta_destino_final, "arquivos gerais")
+            
+            # Garante que essa pasta exista
+            os.makedirs(pasta_arquivos_gerais, exist_ok=True)
+            
+            # Move o arquivo para lá
+            shutil.move(caminho_arquivo, pasta_arquivos_gerais)
+            print(f"    -> Arquivo movido para: {pasta_arquivos_gerais}")
+        except Exception as e:
+            print(f"      -> ERRO ao mover arquivo para 'arquivos gerais': {e}")
 
     def _classificar_renomear_e_mover(self, caminho_arquivo, texto_pdf):
         """Compara o texto normalizado com as regras e move o arquivo."""
         texto_pdf_normalizado = self._normalizar_texto(texto_pdf)
+        
+        # --- INÍCIO DA CORREÇÃO (ECAD BUG) ---
+        # Cria uma versão do texto do PDF sem espaços para uma correspondência mais robusta
+        # Isso corrige casos como "E C A D" ou "Mídia Regional"
+        texto_pdf_sem_espacos = texto_pdf_normalizado.replace(" ", "")
+        # --- FIM DA CORREÇÃO (ECAD BUG) ---
+
         print("    -> Verificando regras de classificação...")
         
         categoria_final_para_nome = None
@@ -158,9 +183,12 @@ class FiscalBot:
                 sub_categoria_encontrada = None
                 # PRIMEIRO, procura pelas subcategorias que são mais específicas
                 for sub_cat, sub_palavra_chave in regra["subcategorias"].items():
-                    sub_chave_normalizada = self._normalizar_texto(sub_palavra_chave)
-                    print(f"      - Testando sub-regra '{sub_cat}'. Procurando por: '{sub_chave_normalizada}'...")
-                    if sub_chave_normalizada in texto_pdf_normalizado:
+                    # Remove espaços da regra para a comparação
+                    sub_chave_normalizada = self._normalizar_texto(sub_palavra_chave).replace(" ", "")
+                    # print(f"      - Testando sub-regra '{sub_cat}'. Procurando por: '{sub_chave_normalizada}'...")
+                    
+                    # Compara a regra (sem espaços) com o PDF (sem espaços)
+                    if sub_chave_normalizada in texto_pdf_sem_espacos: 
                         print(f"      -> Subcategoria encontrada: '{sub_cat}'")
                         sub_categoria_encontrada = sub_cat
                         break
@@ -171,18 +199,22 @@ class FiscalBot:
                     break
                 
                 # SE NÃO ACHOU subcategoria, procura pelo gatilho geral
-                gatilho_normalizado = self._normalizar_texto(regra.get("gatilho", ""))
-                print(f"      - Testando gatilho '{categoria}'. Procurando por: '{gatilho_normalizado}'...")
-                if gatilho_normalizado and gatilho_normalizado in texto_pdf_normalizado:
+                # Remove espaços da regra para a comparação
+                gatilho_normalizado = self._normalizar_texto(regra.get("gatilho", "")).replace(" ", "")
+                # print(f"      - Testando gatilho '{categoria}'. Procurando por: '{gatilho_normalizado}'...")
+                
+                if gatilho_normalizado and gatilho_normalizado in texto_pdf_sem_espacos: # Compara com PDF sem espaços
                     print(f"      -> GATILHO ENCONTRADO para '{categoria}'.")
                     caminho_relativo_pasta = categoria
                     categoria_final_para_nome = categoria
                     break
             
             elif isinstance(regra, str):
-                regra_normalizada = self._normalizar_texto(regra)
-                print(f"      - Testando regra simples '{categoria}'. Procurando por: '{regra_normalizada}'...")
-                if regra_normalizada and regra_normalizada in texto_pdf_normalizado:
+                # Remove espaços da regra para a comparação
+                regra_normalizada = self._normalizar_texto(regra).replace(" ", "")
+                # print(f"      - Testando regra simples '{categoria}'. Procurando por: '{regra_normalizada}'...")
+                
+                if regra_normalizada and regra_normalizada in texto_pdf_sem_espacos: # Compara com PDF sem espaços
                     print(f"      -> REGRA ENCONTRADA para '{categoria}'")
                     caminho_relativo_pasta = categoria
                     categoria_final_para_nome = categoria
@@ -200,8 +232,10 @@ class FiscalBot:
             except Exception as e:
                 print(f"      -> ERRO ao mover/renomear arquivo: {e}")
         else:
-            print("    -> Nenhuma regra correspondeu. Movendo para a pasta de destino principal.")
-            shutil.move(caminho_arquivo, self.pasta_destino_final)
+            # --- LÓGICA 'arquivos gerais' ---
+            print("    -> Nenhuma regra correspondeu. Movendo para a pasta 'arquivos gerais'.")
+            self._mover_para_arquivos_gerais(caminho_arquivo)
+            # --- FIM DA LÓGICA ---
 
     def _ir_para_proxima_pagina(self):
         """Clica no botão de próxima página e espera o recarregamento."""
@@ -228,7 +262,7 @@ class FiscalBot:
             colunas = ['LOJA', 'REFERÊNCIA SAP', 'NÚMERO DUPLIC.', 'DATA DE EMISSÃO', 'VENCIMENTO', 'VALOR', 'ARQUIVO']
             df = pd.DataFrame(self.dados_processados)
             df.columns = colunas[:len(df.columns)]
-            print(df)
+            print(df.to_string()) # .to_string() garante que todo o df seja impresso
 
     def executar(self):
         """Método principal que orquestra toda a automação."""
@@ -258,7 +292,16 @@ if __name__ == "__main__":
     PASTA_DOWNLOAD_TEMP = "C:\\Users\\gabri\\Downloads\\Notas_Temporarias"
 
     # 2. Defina a pasta FINAL onde os arquivos serão organizados.
-    PASTA_DESTINO_FINAL = "C:\\Users\\gabri\\Downloads\\Notas_de_Debito_Organizadas"
+    # --- MODIFICAÇÃO PARA ADICIONAR DATA ---
+    
+    # Define o nome base da pasta
+    pasta_base_destino = "C:\\Users\\gabri\\Downloads\\Notas_de_Debito_Organizadas"
+    # Pega a data de hoje e formata (ex: 2025-10-24)
+    hoje_str = date.today().strftime("%d-%m-%Y")
+    # Junta o nome base com a data de hoje
+    PASTA_DESTINO_FINAL = f"{pasta_base_destino}_{hoje_str}"
+    
+    # --- FIM DA MODIFICAÇÃO ---
 
     # 3. Defina suas regras de classificação.
     #    Não se preocupe com acentos ou maiúsculas/minúsculas.
@@ -279,9 +322,11 @@ if __name__ == "__main__":
     # ========================================================================
     
     print("Iniciando automação...")
+    print(f"Pasta de destino final será: {PASTA_DESTINO_FINAL}")
+    
     try:
         os.makedirs(PASTA_DOWNLOAD_TEMP, exist_ok=True)
-        os.makedirs(PASTA_DESTINO_FINAL, exist_ok=True)
+        os.makedirs(PASTA_DESTINO_FINAL, exist_ok=True) # Cria a pasta com data
 
         edge_options = Options()
         prefs = {"download.default_directory": PASTA_DOWNLOAD_TEMP}
@@ -297,5 +342,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n--- ERRO NO PROCESSAMENTO GERAL ---")
         print(f"Ocorreu um erro inesperado: {e}")
+        print("Dicas:")
+        print("- Verifique se o navegador está aberto no modo de depuração (debug).")
+        print("- Confirme se os caminhos das pastas estão corretos.")
+        print("- Verifique se os seletores (selectors) no código correspondem ao site.")
     finally:
         print("\nScript finalizado. O navegador continua aberto.")
